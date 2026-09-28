@@ -31,7 +31,13 @@ export interface TermRule {
   createdAt: number;
 }
 
+/**
+ * 单个频道（主会场 / 分会场 / 采访间）的完整值守状态。
+ * 队列、正在编辑的片段、术语规则、直播输出和连接状态都只属于一个频道。
+ */
 export interface DeskModel {
+  channelId: string;
+  channelName: string;
   eventName: string;
   eventDate: string;
   segments: CaptionSegment[];
@@ -39,10 +45,18 @@ export interface DeskModel {
   selectedId: string;
   connection: ConnectionState;
   simulatedDelay: number;
-  fontSize: number;
   nextSequence: number;
   autoStream: boolean;
   lastMergedAt?: number;
+  updatedAt: number;
+}
+
+/** 多频道工作台：各频道状态互相隔离，字号等界面偏好为全局设置。 */
+export interface DeskWorkspace {
+  version: 2;
+  channels: DeskModel[];
+  activeChannelId: string;
+  fontSize: number;
   updatedAt: number;
 }
 
@@ -54,7 +68,9 @@ export interface ToastMessage {
 }
 
 const now = Date.now();
+/** 旧版单频道数据，同时承担主题偏好的存储键后缀。 */
 export const STORAGE_KEY = 'sologsb-1011-live-caption-desk-v1';
+export const WORKSPACE_STORAGE_KEY = 'sologsb-1011-live-caption-desk-v2';
 
 function segment(
   id: string,
@@ -82,7 +98,11 @@ function segment(
   };
 }
 
-const seededSegments: CaptionSegment[] = [
+function duplicateSegment(base: CaptionSegment, duplicateOf: string, reason: string): CaptionSegment {
+  return { ...base, state: 'duplicate', duplicateOf, staleReason: reason };
+}
+
+const mainHallSegments: CaptionSegment[] = [
   segment('seg-1', 1, 0, '主持人', '欢迎大家来到二零二六年产品发布会。', '欢迎大家来到2026年产品发布会。', 'confirmed'),
   segment('seg-2', 2, 7, '主讲人', '今天我们会介绍三个模块,首先是实时协作。', '今天我们会介绍三个模块，首先是实时协作。', 'confirmed'),
   segment('seg-3', 3, 15, '主讲人', '延迟和质量监测会帮助我们保持字幕稳定。', '延迟和质量监测会帮助我们保持字幕稳定。', 'confirmed'),
@@ -90,33 +110,131 @@ const seededSegments: CaptionSegment[] = [
   segment('seg-5', 5, 34, '嘉宾 / 周然', '每分钟大约会收到一百二十个片段。', '每分钟大约会收到120个片段。', 'pending'),
   segment('seg-6', 6, 43, '主持人', '如果主持人提到 co pilot,需要统一大小写。', '如果主持人提到 Co-Pilot，需要统一大小写。', 'pending'),
   segment('seg-7', 7, 52, '主持人', '这个例子会演示五G网络下的字幕恢复。', '这个例子会演示5G网络下的字幕恢复。', 'pending'),
+  duplicateSegment(
+    segment('seg-8', 8, 61, '主讲人', '今天我们重点讨论字幕队列。', '今天我们重点讨论字幕队列。', 'pending'),
+    'seg-2',
+    '与第 2 段高度相似',
+  ),
 ];
 
-const duplicate: CaptionSegment = {
-  ...segment('seg-8', 8, 61, '主讲人', '今天我们重点讨论字幕队列。', '今天我们重点讨论字幕队列。', 'duplicate'),
-  source: 'live',
-  duplicateOf: 'seg-2',
-  staleReason: '与第 2 段高度相似',
+const subForumSegments: CaptionSegment[] = [
+  segment('sub-1', 1, 0, '分论坛主持', '各位线上线下的来宾,欢迎来到实时协作分论坛。', '各位线上线下的来宾，欢迎来到实时协作分论坛。', 'confirmed'),
+  segment('sub-2', 2, 8, '架构师 / 沈拓', '我们先看分布式编辑里的冲突解决模型。', '我们先看分布式编辑里的冲突解决模型。', 'confirmed'),
+  segment('sub-3', 3, 17, '产品经理', '侧边栏已经嵌入 co pilot 的建议能力。', '侧边栏已经嵌入 co pilot 的建议能力。', 'pending'),
+  segment('sub-4', 4, 26, '架构师 / 沈拓', '单集群可以支撑八十万条并发操作。', '单集群可以支撑80万条并发操作。', 'pending'),
+  segment('sub-5', 5, 35, '现场提问', 'open api 的限流策略接下来会调整吗?', 'open api 的限流策略接下来会调整吗？', 'pending'),
+  duplicateSegment(
+    segment('sub-6', 6, 43, '架构师 / 沈拓', '我们先看分布式编辑里的冲突解决模型。', '我们先看分布式编辑里的冲突解决模型。', 'pending'),
+    'sub-2',
+    '与第 2 段高度相似',
+  ),
+];
+
+const interviewSegments: CaptionSegment[] = [
+  segment('iv-1', 1, 0, '记者', '林越你好,感谢你接受本场赛后采访。', '林越你好，感谢你接受本场赛后采访。', 'confirmed'),
+  segment('iv-2', 2, 8, '受访嘉宾 / 林越', '今天团队的执行力比上一场好很多。', '今天团队的执行力比上一场好很多。', 'confirmed'),
+  segment('iv-3', 3, 17, '记者', '能聊聊第四代引擎的改进吗?', '能聊聊第四代引擎的改进吗？', 'pending'),
+  segment('iv-4', 4, 26, '受访嘉宾 / 林越', '我们和 studio london 团队联调了三周。', '我们和 studio london 团队联调了三周。', 'pending'),
+  segment('iv-5', 5, 35, '导播', '采访间信号正常,五G背包码率稳定。', '采访间信号正常，5G背包码率稳定。', 'pending'),
+  duplicateSegment(
+    segment('iv-6', 6, 44, '受访嘉宾 / 林越', '今天团队的执行力确实比上一场好很多。', '今天团队的执行力确实比上一场好很多。', 'pending'),
+    'iv-2',
+    '与第 2 段高度相似',
+  ),
+];
+
+type ChannelSeed = {
+  id: string;
+  name: string;
+  eventName: string;
+  segments: CaptionSegment[];
+  rules: TermRule[];
+  selectedId: string;
+  nextSequence: number;
 };
 
-export function createInitialModel(): DeskModel {
+function createChannel(seed: ChannelSeed): DeskModel {
   return {
-    eventName: '新品发布会现场字幕',
+    channelId: seed.id,
+    channelName: seed.name,
+    eventName: seed.eventName,
     eventDate: new Date(now).toISOString().slice(0, 10),
-    segments: [...seededSegments, duplicate],
-    rules: [
-      { id: 'term-1', source: 'co pilot', replacement: 'Co-Pilot', speaker: '', enabled: true, caseSensitive: false, usageCount: 4, createdAt: now - 86_400_000 },
-      { id: 'term-2', source: 'studio cloud', replacement: 'Studio Cloud', speaker: '', enabled: true, caseSensitive: false, usageCount: 7, createdAt: now - 43_200_000 },
-      { id: 'term-3', source: '五G', replacement: '5G', speaker: '', enabled: true, caseSensitive: true, usageCount: 2, createdAt: now - 3_600_000 },
-    ],
-    selectedId: 'seg-4',
+    segments: seed.segments,
+    rules: seed.rules,
+    selectedId: seed.selectedId,
     connection: 'connected',
     simulatedDelay: 1.8,
-    fontSize: 18,
-    nextSequence: 9,
+    nextSequence: seed.nextSequence,
     autoStream: true,
     updatedAt: now,
   };
+}
+
+export function createInitialWorkspace(): DeskWorkspace {
+  const channels: DeskModel[] = [
+    createChannel({
+      id: 'main',
+      name: '主会场',
+      eventName: '新品发布会现场字幕',
+      segments: mainHallSegments,
+      selectedId: 'seg-4',
+      nextSequence: 9,
+      rules: [
+        { id: 'term-1', source: 'co pilot', replacement: 'Co-Pilot', speaker: '', enabled: true, caseSensitive: false, usageCount: 4, createdAt: now - 86_400_000 },
+        { id: 'term-2', source: 'studio cloud', replacement: 'Studio Cloud', speaker: '', enabled: true, caseSensitive: false, usageCount: 7, createdAt: now - 43_200_000 },
+        { id: 'term-3', source: '五G', replacement: '5G', speaker: '', enabled: true, caseSensitive: true, usageCount: 2, createdAt: now - 3_600_000 },
+      ],
+    }),
+    createChannel({
+      id: 'sub',
+      name: '分会场',
+      eventName: '实时协作技术分论坛',
+      segments: subForumSegments,
+      selectedId: 'sub-3',
+      nextSequence: 7,
+      rules: [
+        { id: 'term-sub-1', source: 'co pilot', replacement: 'Co-Pilot', speaker: '', enabled: true, caseSensitive: false, usageCount: 3, createdAt: now - 72_000_000 },
+        { id: 'term-sub-2', source: 'open api', replacement: 'OpenAPI', speaker: '', enabled: true, caseSensitive: false, usageCount: 5, createdAt: now - 28_800_000 },
+        { id: 'term-sub-3', source: '八十万', replacement: '80万', speaker: '', enabled: true, caseSensitive: false, usageCount: 1, createdAt: now - 1_800_000 },
+      ],
+    }),
+    createChannel({
+      id: 'interview',
+      name: '采访间',
+      eventName: '赛后媒体采访间',
+      segments: interviewSegments,
+      selectedId: 'iv-3',
+      nextSequence: 7,
+      rules: [
+        { id: 'term-iv-1', source: 'studio london', replacement: 'Studio London', speaker: '', enabled: true, caseSensitive: false, usageCount: 2, createdAt: now - 36_000_000 },
+        { id: 'term-iv-2', source: '五G', replacement: '5G', speaker: '', enabled: true, caseSensitive: true, usageCount: 1, createdAt: now - 2_400_000 },
+      ],
+    }),
+  ];
+  return { version: 2, channels, activeChannelId: 'main', fontSize: 18, updatedAt: now };
+}
+
+/** 旧版单频道草稿迁移为只有一个主会场频道的工作台。 */
+export function migrateLegacyWorkspace(raw: string): DeskWorkspace | undefined {
+  try {
+    const legacy = JSON.parse(raw) as Partial<DeskModel> & { fontSize?: number };
+    if (!legacy || !Array.isArray(legacy.segments) || !legacy.segments.length) return undefined;
+    const channel = {
+      ...legacy,
+      channelId: 'main',
+      channelName: '主会场',
+    } as DeskModel;
+    delete (channel as unknown as { fontSize?: number }).fontSize;
+    return {
+      version: 2,
+      channels: [channel],
+      activeChannelId: 'main',
+      fontSize: typeof legacy.fontSize === 'number' ? legacy.fontSize : 18,
+      updatedAt: Date.now(),
+    };
+  } catch {
+    return undefined;
+  }
 }
 
 export function cloneModel(model: DeskModel): DeskModel {
@@ -180,6 +298,7 @@ export function applyRules(text: string, model: DeskModel): { text: string; used
   return { text: normalizePunctuation(next), used };
 }
 
+/** 重复只在调用方传入的同一频道片段集合内判断，不会跨频道比较。 */
 export function isDuplicate(candidate: CaptionSegment, existing: CaptionSegment[]): CaptionSegment | undefined {
   const normalize = (value: string) => value.replace(/[\s，。！？；：,.;:!?]/g, '').toLocaleLowerCase();
   const candidateText = normalize(candidate.corrected || candidate.original);
@@ -191,6 +310,7 @@ export function isDuplicate(candidate: CaptionSegment, existing: CaptionSegment[
   });
 }
 
+/** 断线恢复：仅合并当前频道，按本频道序号和开始时间排序，重复仅在本频道内复查。 */
 export function mergeConfirmedSegments(model: DeskModel): DeskModel {
   const seen: string[] = [];
   const segments = model.segments
@@ -236,25 +356,53 @@ export function queueStats(model: DeskModel) {
   };
 }
 
-export function createLiveSegment(sequence: number): CaptionSegment {
-  const speakers = ['主持人', '主讲人', '嘉宾 / 周然', '现场提问'];
-  const samples = [
-    '接下来请产品团队介绍新的工作流。',
-    '请注意屏幕右侧的实时队列状态。',
-    '在弱网环境下我们会保留未确认片段。',
-    '如果网络恢复,系统会按照时间顺序自动合并。',
-    '这段字幕包含二零二五年的项目数据。',
-    '大家可以在会后查看完整回放和术语表。',
-  ];
+const channelFeeds: Record<string, { speakers: string[]; samples: string[] }> = {
+  main: {
+    speakers: ['主持人', '主讲人', '嘉宾 / 周然', '现场提问'],
+    samples: [
+      '接下来请产品团队介绍新的工作流。',
+      '请注意屏幕右侧的实时队列状态。',
+      '在弱网环境下我们会保留未确认片段。',
+      '如果网络恢复,系统会按照时间顺序自动合并。',
+      '这段字幕包含二零二五年的项目数据。',
+      '大家可以在会后查看完整回放和术语表。',
+    ],
+  },
+  sub: {
+    speakers: ['分论坛主持', '架构师 / 沈拓', '产品经理', '现场提问'],
+    samples: [
+      '分论坛稍后会开放五分钟的自由提问。',
+      '冲突合并会保留每个频道的本地草稿。',
+      '这段路线图分享包含二零二六年的排期。',
+      '接口层会按频道隔离术语规则。',
+      '弱网恢复后请按序号核对本论坛时间线。',
+      'open api 文档已经同步到开发者门户。',
+    ],
+  },
+  interview: {
+    speakers: ['记者', '受访嘉宾 / 林越', '导播'],
+    samples: [
+      '现在把镜头交回主会场。',
+      '这个问题我想从训练安排开始说起。',
+      '采访间的字幕会单独导出归档。',
+      '恢复连线后我们继续后面的提问。',
+      '现场观众的声音也能通过五G背包收进来。',
+      '相关数据会在发布会结束后统一公开。',
+    ],
+  },
+};
+
+export function createLiveSegment(sequence: number, channelId = 'main'): CaptionSegment {
+  const feed = channelFeeds[channelId] ?? channelFeeds.main;
   const start = Math.max(0, sequence * 9 - 10);
   return {
-    id: `seg-live-${sequence}-${Date.now().toString(36)}`,
+    id: `seg-live-${channelId}-${sequence}-${Date.now().toString(36)}`,
     sequence,
     startTime: start,
     receivedAt: Date.now(),
-    speaker: speakers[(sequence - 1) % speakers.length],
-    original: samples[(sequence - 1) % samples.length],
-    corrected: samples[(sequence - 1) % samples.length],
+    speaker: feed.speakers[(sequence - 1) % feed.speakers.length],
+    original: feed.samples[(sequence - 1) % feed.samples.length],
+    corrected: feed.samples[(sequence - 1) % feed.samples.length],
     numberHints: '',
     source: 'live',
     state: 'pending',
@@ -263,6 +411,7 @@ export function createLiveSegment(sequence: number): CaptionSegment {
   };
 }
 
+/** 模拟某一个频道的流延迟与新片段到达，不影响其他频道。 */
 export function simulateLatency(model: DeskModel): DeskModel {
   if (model.connection === 'offline') return model;
   const step = model.connection === 'degraded' ? 0.7 : model.simulatedDelay > 2.8 ? -0.3 : 0.15;
@@ -271,7 +420,7 @@ export function simulateLatency(model: DeskModel): DeskModel {
   let nextSequence = model.nextSequence;
   let segments = model.segments;
   if (applyStream) {
-    const candidate = createLiveSegment(model.nextSequence);
+    const candidate = createLiveSegment(model.nextSequence, model.channelId);
     const duplicate = isDuplicate(candidate, segments);
     segments = [...segments, duplicate ? { ...candidate, state: 'duplicate', duplicateOf: duplicate.id, staleReason: `与第 ${duplicate.sequence} 段重复` } : candidate];
     nextSequence += 1;
