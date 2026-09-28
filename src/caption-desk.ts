@@ -2,15 +2,19 @@ import { LitElement, css, html, nothing } from 'lit';
 import { customElement, state } from 'lit/decorators.js';
 import {
   applyRules,
+  CHANNELS,
   cloneModel,
   createInitialModel,
   mergeConfirmedSegments,
+  migrateModel,
   normalizeNumbers,
   queueStats,
   STORAGE_KEY,
   simulateLatency,
   toSrt,
   type CaptionSegment,
+  type ChannelId,
+  type ChannelModel,
   type ConnectionState,
   type DeskModel,
   type SegmentState,
@@ -18,6 +22,20 @@ import {
 } from './model';
 
 const HISTORY_LIMIT = 80;
+
+type QueueFilter = 'active' | 'all' | 'attention';
+
+interface DraftView {
+  ruleSource: string;
+  ruleReplacement: string;
+  ruleSpeaker: string;
+  showRuleForm: boolean;
+  filter: QueueFilter;
+}
+
+function emptyDraft(): DraftView {
+  return { ruleSource: '', ruleReplacement: '', ruleSpeaker: '', showRuleForm: false, filter: 'active' };
+}
 
 function formatClock(seconds: number): string {
   const minutes = Math.floor(seconds / 60);
@@ -62,7 +80,7 @@ export class CaptionDesk extends LitElement {
     .shell {
       min-height: 100vh;
       display: grid;
-      grid-template-rows: auto auto 1fr;
+      grid-template-rows: auto auto auto 1fr;
       background:
         linear-gradient(90deg, rgba(15,98,254,.025) 1px, transparent 1px),
         linear-gradient(rgba(15,98,254,.025) 1px, transparent 1px),
@@ -120,6 +138,27 @@ export class CaptionDesk extends LitElement {
 
     .header-actions { justify-self: end; display: flex; align-items: center; gap: 8px; }
     .header-actions cds-button { --cds-button-primary: #0f62fe; }
+
+    .channel-bar { display: flex; align-items: stretch; gap: 2px; padding: 0 16px; background: #262626; border-bottom: 1px solid #393939; overflow-x: auto; }
+    .channel-tab {
+      flex: 0 1 268px; min-width: 196px; display: grid; grid-template-columns: auto 1fr auto; grid-template-rows: auto auto;
+      align-items: center; gap: 2px 10px; padding: 8px 14px 9px; background: transparent; border: 0; border-bottom: 2px solid transparent;
+      color: #a8a8a8; cursor: pointer; text-align: left; font-family: inherit;
+    }
+    .channel-tab:hover { background: #333333; color: #f4f4f4; }
+    .channel-tab.active { background: #303030; border-bottom-color: #78a9ff; color: #ffffff; }
+    .channel-dot { grid-row: 1 / 3; width: 8px; height: 8px; border-radius: 50%; background: #42be65; }
+    .channel-dot.degraded { background: #f1c21b; }
+    .channel-dot.offline { background: #fa4d56; }
+    .channel-name { font-size: 12px; font-weight: 600; white-space: nowrap; }
+    .channel-delay { font: 10px/1 "IBM Plex Mono", monospace; color: #8d8d8d; }
+    .channel-meta { grid-column: 2 / 4; display: flex; gap: 5px; flex-wrap: wrap; }
+    .channel-badge { font-size: 9px; line-height: 1.5; padding: 0 6px; background: #393939; color: #c6c6c6; white-space: nowrap; }
+    .channel-badge.busy { background: #0f4abe; color: #ffffff; }
+    .channel-badge.alert { background: #6929c4; color: #ffffff; }
+    .channel-badge.offbox { background: #da1e28; color: #ffffff; }
+    .channel-badge.clear { background: transparent; border: 1px solid #525252; color: #8d8d8d; }
+    .channel-hint { margin-left: auto; align-self: center; color: #6f6f6f; font-size: 10px; white-space: nowrap; padding-left: 12px; }
 
     .status-strip {
       min-height: 60px; padding: 8px 20px; display: grid; grid-template-columns: 1.5fr repeat(4, minmax(118px, .6fr)) auto;
@@ -235,30 +274,43 @@ export class CaptionDesk extends LitElement {
       .shell { display: block; }
       .status-strip { grid-template-columns: repeat(4, 1fr); }
       .status-cell.hero { grid-column: 1 / -1; }
+      .channel-hint { display: none; }
     }
   `;
 
-  @state() private model: DeskModel = this.loadModel();
+  @state() private workbench: DeskModel = this.loadWorkbench();
   @state() private dark = localStorage.getItem(`${STORAGE_KEY}-theme`) === 'dark';
   @state() private toasts: ToastMessage[] = [];
-  @state() private ruleSource = '';
-  @state() private ruleReplacement = '';
-  @state() private ruleSpeaker = '';
-  @state() private filter: 'active' | 'all' | 'attention' = 'active';
-  @state() private showRuleForm = false;
-  private past: DeskModel[] = [];
-  private future: DeskModel[] = [];
+  @state() private drafts: Record<ChannelId, DraftView> = {
+    main: emptyDraft(),
+    breakout: emptyDraft(),
+    interview: emptyDraft(),
+  };
+  private histories: Record<ChannelId, { past: ChannelModel[]; future: ChannelModel[] }> = {
+    main: { past: [], future: [] },
+    breakout: { past: [], future: [] },
+    interview: { past: [], future: [] },
+  };
   private ticker?: number;
 
   connectedCallback(): void {
     super.connectedCallback();
     window.addEventListener('keydown', this.handleShortcut);
     this.ticker = window.setInterval(() => {
-      const next = simulateLatency(this.model);
-      const changed = JSON.stringify(next.segments) !== JSON.stringify(this.model.segments) || next.connection !== this.model.connection;
-      if (!changed) return;
-      this.model = next;
-      this.persist();
+      // 三路信号各自推流，未值守的频道也会积压，但数据互不串用。
+      const channels = { ...this.workbench.channels };
+      let changed = false;
+      for (const id of CHANNELS.map((item) => item.id)) {
+        const before = channels[id];
+        const after = simulateLatency(before, id);
+        if (after === before) continue;
+        const segmentChanged = JSON.stringify(after.segments) !== JSON.stringify(before.segments) || after.connection !== before.connection;
+        if (segmentChanged) {
+          channels[id] = after;
+          changed = true;
+        }
+      }
+      if (changed) this.replaceWorkbench({ ...this.workbench, channels });
     }, 5_000);
   }
 
@@ -268,13 +320,10 @@ export class CaptionDesk extends LitElement {
     super.disconnectedCallback();
   }
 
-  private loadModel(): DeskModel {
+  private loadWorkbench(): DeskModel {
     try {
       const raw = localStorage.getItem(STORAGE_KEY);
-      if (raw) {
-        const parsed = JSON.parse(raw) as DeskModel;
-        if (parsed.segments?.length) return parsed;
-      }
+      if (raw) return migrateModel(JSON.parse(raw));
     } catch {
       // 损坏草稿会回退到演示数据。
     }
@@ -282,39 +331,78 @@ export class CaptionDesk extends LitElement {
   }
 
   private persist(): void {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify({ ...this.model, updatedAt: Date.now() }));
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ ...this.workbench, updatedAt: Date.now() }));
   }
 
-  private commit(label: string, update: (current: DeskModel) => DeskModel): void {
-    const previous = cloneModel(this.model);
-    const next = update(cloneModel(this.model));
+  private get activeId(): ChannelId {
+    return this.workbench.activeChannelId;
+  }
+
+  private get channel(): ChannelModel {
+    return this.workbench.channels[this.activeId];
+  }
+
+  private get draft(): DraftView {
+    return this.drafts[this.activeId];
+  }
+
+  private channelName(id: ChannelId): string {
+    return CHANNELS.find((item) => item.id === id)?.name ?? id;
+  }
+
+  private replaceWorkbench(next: DeskModel): void {
+    this.workbench = { ...next, updatedAt: Date.now() };
+    this.persist();
+  }
+
+  /** 只修改当前频道，并把修改前快照压入当前频道自己的撤销栈。 */
+  private commit(label: string, update: (current: ChannelModel) => ChannelModel): void {
+    const id = this.activeId;
+    const previous = cloneModel(this.channel);
+    const next = update(cloneModel(this.channel));
     next.updatedAt = Date.now();
-    this.past = [...this.past, previous].slice(-HISTORY_LIMIT);
-    this.future = [];
-    this.model = next;
+    const history = this.histories[id];
+    history.past = [...history.past, previous].slice(-HISTORY_LIMIT);
+    history.future = [];
+    this.workbench = {
+      ...this.workbench,
+      channels: { ...this.workbench.channels, [id]: next },
+      updatedAt: Date.now(),
+    };
     this.persist();
-    if (label) this.pushToast('info', label, '已写入浏览器本地草稿');
+    if (label) this.pushToast('info', label, `${this.channelName(id)} · 已写入浏览器本地草稿`);
   }
 
-  private automatic(next: DeskModel): void {
-    this.model = next;
+  /** 选中、字号调整等不进撤销栈的自动保存。 */
+  private automatic(next: ChannelModel): void {
+    const id = this.activeId;
+    this.workbench = {
+      ...this.workbench,
+      channels: { ...this.workbench.channels, [id]: { ...next, updatedAt: Date.now() } },
+      updatedAt: Date.now(),
+    };
     this.persist();
+  }
+
+  private patchDraft(patch: Partial<DraftView>): void {
+    const id = this.activeId;
+    this.drafts = { ...this.drafts, [id]: { ...this.drafts[id], ...patch } };
   }
 
   private undo(): void {
-    const previous = this.past.pop();
-    if (!previous) return this.pushToast('info', '没有可撤销的修改', '历史记录为空');
-    this.future = [cloneModel(this.model), ...this.future].slice(0, HISTORY_LIMIT);
-    this.model = previous;
-    this.persist();
+    const history = this.histories[this.activeId];
+    const previous = history.past.pop();
+    if (!previous) return this.pushToast('info', '没有可撤销的修改', `${this.channelName(this.activeId)} 的历史记录为空`);
+    history.future = [cloneModel(this.channel), ...history.future].slice(0, HISTORY_LIMIT);
+    this.automatic(previous);
   }
 
   private redo(): void {
-    const next = this.future.shift();
+    const history = this.histories[this.activeId];
+    const next = history.future.shift();
     if (!next) return;
-    this.past = [...this.past, cloneModel(this.model)].slice(-HISTORY_LIMIT);
-    this.model = next;
-    this.persist();
+    history.past = [...history.past, cloneModel(this.channel)].slice(-HISTORY_LIMIT);
+    this.automatic(next);
   }
 
   private pushToast(kind: ToastMessage['kind'], title: string, subtitle: string): void {
@@ -326,17 +414,18 @@ export class CaptionDesk extends LitElement {
   }
 
   private get selected(): CaptionSegment | undefined {
-    return this.model.segments.find((item) => item.id === this.model.selectedId);
+    return this.channel.segments.find((item) => item.id === this.channel.selectedId);
   }
 
   private get stats() {
-    return queueStats(this.model);
+    return queueStats(this.channel);
   }
 
   private get pendingSegments(): CaptionSegment[] {
-    const items = this.model.segments.filter((item) => {
-      if (this.filter === 'active') return item.state === 'pending' || item.state === 'stale' || item.state === 'duplicate';
-      if (this.filter === 'attention') return item.state === 'stale' || item.state === 'duplicate';
+    const filter = this.draft.filter;
+    const items = this.channel.segments.filter((item) => {
+      if (filter === 'active') return item.state === 'pending' || item.state === 'stale' || item.state === 'duplicate';
+      if (filter === 'attention') return item.state === 'stale' || item.state === 'duplicate';
       return true;
     });
     return [...items].sort((a, b) => a.sequence - b.sequence);
@@ -352,20 +441,27 @@ export class CaptionDesk extends LitElement {
   }
 
   private selectSegment(id: string): void {
-    this.model = { ...this.model, selectedId: id };
-    this.persist();
+    this.automatic({ ...this.channel, selectedId: id });
+  }
+
+  private switchChannel(id: ChannelId): void {
+    if (id === this.activeId) return;
+    // 草稿、过滤器和选中片段都按频道存放，切换只换指针，不搬运任何编辑内容。
+    this.replaceWorkbench({ ...this.workbench, activeChannelId: id });
+    const stats = queueStats(this.workbench.channels[id]);
+    this.pushToast('info', `已切换到${this.channelName(id)}`, `队列、草稿、术语与直播输出均为该频道独立保留 · 待处理 ${stats.backlog} 段`);
   }
 
   private navigate(direction: number): void {
-    const candidates = this.pendingSegments.length ? this.pendingSegments : [...this.model.segments].sort((a, b) => a.sequence - b.sequence);
-    const index = candidates.findIndex((item) => item.id === this.model.selectedId);
+    const candidates = this.pendingSegments.length ? this.pendingSegments : [...this.channel.segments].sort((a, b) => a.sequence - b.sequence);
+    const index = candidates.findIndex((item) => item.id === this.channel.selectedId);
     const next = candidates[Math.max(0, Math.min(candidates.length - 1, index + direction))];
     if (next) this.selectSegment(next.id);
   }
 
   private applyTerm(ruleId: string): void {
     const selected = this.selected;
-    const rule = this.model.rules.find((item) => item.id === ruleId);
+    const rule = this.channel.rules.find((item) => item.id === ruleId);
     if (!selected || !rule) return;
     const flags = rule.caseSensitive ? 'g' : 'gi';
     const expression = new RegExp(rule.source.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), flags);
@@ -436,8 +532,9 @@ export class CaptionDesk extends LitElement {
       this.pushToast('warning', '没有可确认的片段', '请先从待确认区选择字幕');
       return;
     }
-    const { text, used } = applyRules(selected.corrected, this.model);
-    const offline = this.model.connection === 'offline';
+    const channelId = this.activeId;
+    const { text, used } = applyRules(selected.corrected, this.channel);
+    const offline = this.channel.connection === 'offline';
     const nextOrder = this.pendingSegments.filter((item) => item.id !== selected.id);
     this.commit('确认并送入直播区', (current) => ({
       ...current,
@@ -454,7 +551,11 @@ export class CaptionDesk extends LitElement {
       rules: current.rules.map((rule) => used.includes(rule.id) ? { ...rule, usageCount: rule.usageCount + 1 } : rule),
       selectedId: nextOrder[0]?.id ?? selected.id,
     }));
-    this.pushToast(offline ? 'warning' : 'success', offline ? '已加入离线发件箱' : '字幕已进入直播区', offline ? '恢复连接后将按时间顺序合并' : `第 ${selected.sequence} 段已确认`);
+    this.pushToast(
+      offline ? 'warning' : 'success',
+      offline ? `已加入${this.channelName(channelId)}离线发件箱` : `${this.channelName(channelId)}直播区已更新`,
+      offline ? '恢复连接后将按本频道时间顺序合并' : `第 ${selected.sequence} 段已确认`,
+    );
   }
 
   private ignoreSelected(): void {
@@ -478,7 +579,8 @@ export class CaptionDesk extends LitElement {
   }
 
   private setConnection(connection: ConnectionState): void {
-    this.commit(connection === 'offline' ? '切换到离线校正' : connection === 'degraded' ? '模拟延迟波动' : '连接已恢复', (current) => ({
+    const id = this.activeId;
+    this.commit(connection === 'offline' ? `切换${this.channelName(id)}到离线校正` : connection === 'degraded' ? '模拟延迟波动' : `${this.channelName(id)}连接已恢复`, (current) => ({
       ...current,
       connection,
       simulatedDelay: connection === 'connected' ? 0.8 : connection === 'degraded' ? 4.6 : current.simulatedDelay,
@@ -486,48 +588,49 @@ export class CaptionDesk extends LitElement {
   }
 
   private mergeOffline(): void {
-    const merged = mergeConfirmedSegments(this.model);
-    this.past = [...this.past, cloneModel(this.model)].slice(-HISTORY_LIMIT);
-    this.future = [];
-    this.model = merged;
-    this.persist();
-    const outboxCount = this.model.segments.filter((item) => item.source === 'offline' && item.state === 'confirmed').length;
-    this.pushToast('success', '离线队列已合并', `${outboxCount} 个片段仍标记为离线来源，过期修改会继续显示提示`);
+    const id = this.activeId;
+    const merged = mergeConfirmedSegments(this.channel);
+    const history = this.histories[id];
+    history.past = [...history.past, cloneModel(this.channel)].slice(-HISTORY_LIMIT);
+    history.future = [];
+    this.automatic(merged);
+    const outboxCount = merged.segments.filter((item) => item.source === 'offline' && item.state === 'confirmed').length;
+    this.pushToast('success', `${this.channelName(id)}离线队列已合并`, `${outboxCount} 个片段仍标记为离线来源，重复与过期仅按本频道顺序重新检查`);
   }
 
   private addRuleFromSelection(): void {
     const selected = this.selected;
     if (!selected) return;
-    this.ruleSource = selected.corrected.length > 24 ? selected.corrected.slice(0, 24) : selected.corrected;
-    this.ruleReplacement = selected.corrected;
-    this.ruleSpeaker = selected.speaker;
-    this.showRuleForm = true;
+    this.patchDraft({
+      ruleSource: selected.corrected.length > 24 ? selected.corrected.slice(0, 24) : selected.corrected,
+      ruleReplacement: selected.corrected,
+      ruleSpeaker: selected.speaker,
+      showRuleForm: true,
+    });
   }
 
   private addRule(): void {
-    const source = this.ruleSource.trim();
-    const replacement = this.ruleReplacement.trim();
+    const source = this.draft.ruleSource.trim();
+    const replacement = this.draft.ruleReplacement.trim();
     if (!source || !replacement) {
       this.pushToast('warning', '规则不完整', '原文和替换文本均不能为空');
       return;
     }
+    const speaker = this.draft.ruleSpeaker;
     this.commit('新增术语快捷规则', (current) => ({
       ...current,
       rules: [{
-        id: `term-${Date.now().toString(36)}`,
+        id: `term-${this.activeId}-${Date.now().toString(36)}`,
         source,
         replacement,
-        speaker: this.ruleSpeaker,
+        speaker,
         enabled: true,
         caseSensitive: false,
         usageCount: 0,
         createdAt: Date.now(),
       }, ...current.rules],
     }));
-    this.ruleSource = '';
-    this.ruleReplacement = '';
-    this.ruleSpeaker = '';
-    this.showRuleForm = false;
+    this.patchDraft({ ruleSource: '', ruleReplacement: '', ruleSpeaker: '', showRuleForm: false });
   }
 
   private deleteRule(id: string): void {
@@ -535,24 +638,25 @@ export class CaptionDesk extends LitElement {
   }
 
   private exportSrt(): void {
-    const content = toSrt(this.model);
+    const channel = this.channel;
+    const content = toSrt(channel);
     if (!content) {
-      this.pushToast('warning', '暂无已确认字幕', '先确认至少一个片段再导出');
+      this.pushToast('warning', `${this.channelName(this.activeId)}暂无已确认字幕`, 'SRT 只包含当前频道，先确认至少一个片段再导出');
       return;
     }
     const blob = new Blob([content], { type: 'application/x-subrip;charset=utf-8' });
     const url = URL.createObjectURL(blob);
     const anchor = document.createElement('a');
     anchor.href = url;
-    anchor.download = `${this.model.eventName.replace(/[^\p{L}\p{N}-]+/gu, '-')}.srt`;
+    anchor.download = `${channel.eventName.replace(/[^\p{L}\p{N}-]+/gu, '-')}-${this.activeId}.srt`;
     anchor.click();
     URL.revokeObjectURL(url);
-    this.pushToast('success', 'SRT 已导出', `${toSrt(this.model).split('\n\n').length} 段字幕`);
+    this.pushToast('success', `${this.channelName(this.activeId)} SRT 已导出`, `${toSrt(channel).split('\n\n').length} 段字幕，其他频道未包含`);
   }
 
   private adjustFont(delta: number): void {
-    const fontSize = Math.max(14, Math.min(28, this.model.fontSize + delta));
-    this.automatic({ ...this.model, fontSize });
+    const fontSize = Math.max(14, Math.min(28, this.workbench.fontSize + delta));
+    this.replaceWorkbench({ ...this.workbench, fontSize });
   }
 
   private toggleTheme(): void {
@@ -577,15 +681,23 @@ export class CaptionDesk extends LitElement {
       this.confirmSelected();
       return;
     }
-    if (event.altKey && event.key.toLocaleLowerCase() === 'j') {
-      event.preventDefault();
-      this.navigate(1);
-      return;
-    }
-    if (event.altKey && event.key.toLocaleLowerCase() === 'k') {
-      event.preventDefault();
-      this.navigate(-1);
-      return;
+    if (event.altKey && !modifier) {
+      const channelIndex = ['1', '2', '3'].indexOf(event.key);
+      if (channelIndex >= 0) {
+        event.preventDefault();
+        this.switchChannel(CHANNELS[channelIndex].id);
+        return;
+      }
+      if (event.key.toLocaleLowerCase() === 'j') {
+        event.preventDefault();
+        this.navigate(1);
+        return;
+      }
+      if (event.key.toLocaleLowerCase() === 'k') {
+        event.preventDefault();
+        this.navigate(-1);
+        return;
+      }
     }
     const punctuation: Record<string, string> = { '1': '，', '2': '。', '3': '？', '4': '！' };
     if (modifier && punctuation[event.key]) {
@@ -594,15 +706,42 @@ export class CaptionDesk extends LitElement {
     }
   };
 
+  private renderChannelBar() {
+    return html`
+      <nav class="channel-bar" aria-label="频道切换">
+        ${CHANNELS.map((channelInfo) => {
+          const data = this.workbench.channels[channelInfo.id];
+          const stats = queueStats(data);
+          const active = channelInfo.id === this.activeId;
+          const attention = stats.stale + stats.duplicate;
+          return html`
+            <button class="channel-tab ${active ? 'active' : ''}" aria-pressed=${active} @click=${() => this.switchChannel(channelInfo.id)}>
+              <span class="channel-dot ${data.connection}"></span>
+              <span class="channel-name">${channelInfo.name}</span>
+              <span class="channel-delay">${data.simulatedDelay.toFixed(1)}s</span>
+              <span class="channel-meta">
+                ${stats.offline > 0 ? html`<span class="channel-badge offbox">发件箱 ${stats.offline}</span>` : nothing}
+                ${stats.backlog - stats.offline > 0
+                  ? html`<span class="channel-badge ${attention > 0 ? 'alert' : 'busy'}">待处理 ${stats.pending + stats.stale + stats.duplicate}</span>`
+                  : html`<span class="channel-badge clear">队列清空</span>`}
+              </span>
+            </button>
+          `;
+        })}
+        <span class="channel-hint"><kbd>Alt</kbd> + <kbd>1/2/3</kbd> 切换频道 · 队列、草稿、术语与直播输出各频道独立</span>
+      </nav>
+    `;
+  }
+
   private renderPendingList() {
     const segments = this.pendingSegments;
     if (!segments.length) {
-      return html`<div class="empty"><strong>待确认区已清空</strong><p>新的实时片段到达时会自动进入这里。</p></div>`;
+      return html`<div class="empty"><strong>${this.channelName(this.activeId)}待确认区已清空</strong><p>新的实时片段到达时会自动进入这里，不影响其他频道。</p></div>`;
     }
     return html`
       <div class="segment-list">
         ${segments.map((item) => html`
-          <button class="segment-card ${item.id === this.model.selectedId ? 'selected' : ''} ${item.state}" @click=${() => this.selectSegment(item.id)}>
+          <button class="segment-card ${item.id === this.channel.selectedId ? 'selected' : ''} ${item.state}" @click=${() => this.selectSegment(item.id)}>
             <div class="segment-meta">
               <span>${formatClock(item.startTime)} · #${String(item.sequence).padStart(3, '0')}</span>
               <span class="segment-state ${item.state}">${stateLabel(item.state)}</span>
@@ -615,8 +754,8 @@ export class CaptionDesk extends LitElement {
               <span>${formatAge(item.receivedAt)}</span>
               ${item.revision > 0 ? html`<span>· <b>修改 ${item.revision} 次</b></span>` : nothing}
             </div>
-            ${item.state === 'stale' && item.staleReason ? html`<div class="issue-note">${item.staleReason}。确认前请核对直播上下文。</div>` : nothing}
-            ${item.state === 'duplicate' ? html`<div class="issue-note duplicate-note">${item.staleReason || '检测到重复片段'}，请保留或忽略。</div>` : nothing}
+            ${item.state === 'stale' && item.staleReason ? html`<div class="issue-note">${item.staleReason}。确认前请核对${this.channelName(this.activeId)}直播上下文。</div>` : nothing}
+            ${item.state === 'duplicate' ? html`<div class="issue-note duplicate-note">${item.staleReason || '检测到重复片段'}（仅与本频道片段比对），请保留或忽略。</div>` : nothing}
           </button>
         `)}
       </div>
@@ -626,16 +765,16 @@ export class CaptionDesk extends LitElement {
   private renderEditor() {
     const item = this.selected;
     if (!item) {
-      return html`<div class="empty"><strong>选择一条待确认字幕</strong><p>可以使用 Alt+J / Alt+K 在片段之间移动。</p></div>`;
+      return html`<div class="empty"><strong>${this.channelName(this.activeId)}没有选中的字幕</strong><p>可以使用 Alt+J / Alt+K 在本频道片段之间移动。</p></div>`;
     }
-    const applicableRules = this.model.rules.filter((rule) => rule.enabled && (!rule.speaker || rule.speaker === item.speaker));
+    const applicableRules = this.channel.rules.filter((rule) => rule.enabled && (!rule.speaker || rule.speaker === item.speaker));
     return html`
       <div class="editor-scroll">
         <div class="editor-card">
           <div class="editor-top">
             <div>
               <div class="editor-time">${formatClock(item.startTime)} — ${formatClock(item.startTime + 7)}</div>
-              <p class="editor-title">实时片段 #${String(item.sequence).padStart(3, '0')} · 到达于 ${formatAge(item.receivedAt)}</p>
+              <p class="editor-title">${this.channelName(this.activeId)} · 实时片段 #${String(item.sequence).padStart(3, '0')} · 到达于 ${formatAge(item.receivedAt)}</p>
             </div>
             <div class="editor-status">
               <cds-tag type=${item.state === 'stale' ? 'warm-gray' : item.state === 'duplicate' ? 'purple' : 'blue'} size="sm">${stateLabel(item.state)}</cds-tag>
@@ -644,23 +783,23 @@ export class CaptionDesk extends LitElement {
           </div>
           <div class="editor-form">
             ${item.state === 'duplicate' ? html`
-              <cds-inline-notification kind="warning" low-contrast title="重复片段提示" subtitle=${item.staleReason || '与已确认片段高度相似'}>
+              <cds-inline-notification kind="warning" low-contrast title="重复片段提示" subtitle=${`${item.staleReason || '与本频道已确认片段高度相似'}（不会跨频道判定）`}>
                 <cds-button slot="action" size="sm" @click=${this.recoverDuplicate}>保留并继续校对</cds-button>
               </cds-inline-notification>
             ` : nothing}
             ${item.state === 'stale' ? html`
-              <cds-inline-notification kind="warning" low-contrast title="过期修改" subtitle=${`${item.staleReason || '该片段已超过 90 秒未确认'}。请结合上下文确认，或忽略以避免污染直播区。`}></cds-inline-notification>
+              <cds-inline-notification kind="warning" low-contrast title="过期修改" subtitle=${`${item.staleReason || '该片段已超过 90 秒未确认'}。请结合${this.channelName(this.activeId)}上下文确认，或忽略以避免污染直播区。`}></cds-inline-notification>
             ` : nothing}
             <div class="form-grid">
               <cds-select label-text="发言人" value=${item.speaker} @cds-select-selected=${(event: CustomEvent<{ value: string }>) => this.updateSelected({ speaker: event.detail.value }, '修改发言人')}>
-                ${['主持人', '主讲人', '嘉宾 / 周然', '现场提问', '未知发言人'].map((speaker) => html`<cds-select-item value=${speaker}>${speaker}</cds-select-item>`)}
+                ${['主持人', '主讲人', '嘉宾 / 周然', '现场提问', '工作坊主持', '讲师 / 林岚', '助教', '记者', '摄像导播', '未知发言人'].map((speaker) => html`<cds-select-item value=${speaker}>${speaker}</cds-select-item>`)}
               </cds-select>
-              <cds-number-input class="number-input" label="延迟（秒）" .value=${this.model.simulatedDelay} step="0.1" min="0" max="9" @input=${(event: Event) => this.automatic({ ...this.model, simulatedDelay: Number((event.currentTarget as any).value) })}></cds-number-input>
+              <cds-number-input class="number-input" label="本频道延迟（秒）" .value=${this.channel.simulatedDelay} step="0.1" min="0" max="9" @input=${(event: Event) => this.automatic({ ...this.channel, simulatedDelay: Number((event.currentTarget as any).value) })}></cds-number-input>
             </div>
             <cds-textarea
               class="caption-input"
-              label-text="校对后的字幕文本"
-              helper-text="Ctrl/⌘ + 1–4 快速插入标点；术语规则将从左到右自动应用"
+              label-text=${`校对后的字幕文本 · ${this.channelName(this.activeId)}草稿`}
+              helper-text="Ctrl/⌘ + 1–4 快速插入标点；术语规则将从左到右自动应用；切频道不会带走此草稿"
               .value=${item.corrected}
               @input=${(event: Event) => this.updateSelected({ corrected: (event.currentTarget as any).value }, '')}
             ></cds-textarea>
@@ -674,15 +813,15 @@ export class CaptionDesk extends LitElement {
               <cds-button kind="secondary" size="sm" @click=${this.normalizeCurrentNumbers}>规范化数字</cds-button>
             </div>
             <div class="rule-suggestions">
-              <small>术语快捷替换</small>
+              <small>${this.channelName(this.activeId)}术语快捷替换</small>
               ${applicableRules.length ? applicableRules.map((rule) => html`
                 <cds-button kind="tertiary" size="sm" @click=${() => this.applyTerm(rule.id)}>${rule.source} → ${rule.replacement}</cds-button>
-              `) : html`<small>当前发言人的规则为空</small>`}
+              `) : html`<small>当前发言人在本频道的规则为空</small>`}
               <cds-button kind="ghost" size="sm" @click=${this.addRuleFromSelection}>＋ 从当前文本新建</cds-button>
             </div>
           </div>
           <div class="confirm-bar">
-            <div class="confirm-hint"><kbd>⌘/Ctrl Enter</kbd> 确认并进入直播区 · <kbd>Alt J/K</kbd> 切换片段</div>
+            <div class="confirm-hint"><kbd>⌘/Ctrl Enter</kbd> 确认并进入${this.channelName(this.activeId)}直播区 · <kbd>Alt J/K</kbd> 切换片段 · <kbd>Alt 1/2/3</kbd> 切频道</div>
             <div>
               <cds-button kind="danger--tertiary" size="sm" @click=${this.ignoreSelected}>忽略片段</cds-button>
               <cds-button kind="primary" @click=${this.confirmSelected}>确认并送入直播区</cds-button>
@@ -695,16 +834,18 @@ export class CaptionDesk extends LitElement {
 
   private renderInspector() {
     const item = this.selected;
-    const confirmed = this.model.segments.filter((segment) => segment.state === 'confirmed').sort((a, b) => a.startTime - b.startTime);
+    const channel = this.channel;
+    const confirmed = channel.segments.filter((segment) => segment.state === 'confirmed').sort((a, b) => a.startTime - b.startTime);
+    const stats = queueStats(channel);
     return html`
       <div class="inspector">
         <section class="inspector-section">
           <div class="inspector-section-head">
-            <h3>术语快捷规则</h3>
-            <span>${this.model.rules.filter((rule) => rule.enabled).length} 条启用</span>
+            <h3>${this.channelName(this.activeId)}术语规则</h3>
+            <span>${channel.rules.filter((rule) => rule.enabled).length} 条启用 · 仅本频道生效</span>
           </div>
           <div class="rule-list">
-            ${this.model.rules.map((rule) => html`
+            ${channel.rules.map((rule) => html`
               <div class="rule-item">
                 <div>
                   <strong>${rule.source} → ${rule.replacement}</strong>
@@ -717,21 +858,21 @@ export class CaptionDesk extends LitElement {
               </div>
             `)}
           </div>
-          ${this.showRuleForm ? html`
+          ${this.draft.showRuleForm ? html`
             <div class="rule-form">
-              <cds-text-input label-text="原文" .value=${this.ruleSource} @input=${(event: Event) => { this.ruleSource = (event.currentTarget as any).value; }}></cds-text-input>
-              <cds-text-input label-text="替换为" .value=${this.ruleReplacement} @input=${(event: Event) => { this.ruleReplacement = (event.currentTarget as any).value; }}></cds-text-input>
-              <cds-text-input class="full" label-text="仅对某发言人应用（可空）" .value=${this.ruleSpeaker} @input=${(event: Event) => { this.ruleSpeaker = (event.currentTarget as any).value; }}></cds-text-input>
-              <cds-button class="full" size="sm" kind="primary" @click=${this.addRule}>保存规则</cds-button>
+              <cds-text-input label-text="原文" .value=${this.draft.ruleSource} @input=${(event: Event) => this.patchDraft({ ruleSource: (event.currentTarget as any).value })}></cds-text-input>
+              <cds-text-input label-text="替换为" .value=${this.draft.ruleReplacement} @input=${(event: Event) => this.patchDraft({ ruleReplacement: (event.currentTarget as any).value })}></cds-text-input>
+              <cds-text-input class="full" label-text="仅对某发言人应用（可空）" .value=${this.draft.ruleSpeaker} @input=${(event: Event) => this.patchDraft({ ruleSpeaker: (event.currentTarget as any).value })}></cds-text-input>
+              <cds-button class="full" size="sm" kind="primary" @click=${this.addRule}>保存到${this.channelName(this.activeId)}</cds-button>
             </div>
           ` : html`
-            <div style="padding: 10px;"><cds-button kind="tertiary" size="sm" @click=${() => { this.showRuleForm = true; }}>＋ 新增术语规则</cds-button></div>
+            <div style="padding: 10px;"><cds-button kind="tertiary" size="sm" @click=${() => this.patchDraft({ showRuleForm: true })}>＋ 新增术语规则</cds-button></div>
           `}
         </section>
 
         <section class="inspector-section">
           <div class="inspector-section-head">
-            <h3>直播区时间线</h3>
+            <h3>${this.channelName(this.activeId)}直播输出</h3>
             <span>${confirmed.length} 段已确认</span>
           </div>
           <div class="live-timeline">
@@ -739,11 +880,11 @@ export class CaptionDesk extends LitElement {
               <article class="live-item">
                 <time>${formatClock(segment.startTime)} · ${segment.speaker}</time>
                 <p>${segment.corrected}</p>
-                ${segment.source === 'offline' ? html`<small>离线来源 · 恢复后合并</small>` : nothing}
+                ${segment.source === 'offline' ? html`<small>离线来源 · 恢复后按本频道顺序合并</small>` : nothing}
               </article>
-            `) : html`<div class="empty"><strong>直播区等待内容</strong><p>确认一块字幕后，它会从这里进入实时输出。</p></div>`}
+            `) : html`<div class="empty"><strong>${this.channelName(this.activeId)}直播区等待内容</strong><p>确认一块字幕后，它只会进入当前频道的实时输出。</p></div>`}
           </div>
-          ${this.stats.offline > 0 ? html`<div class="delivery-status">离线发件箱有 ${this.stats.offline} 段待合并。恢复连接后按时间顺序提交，不会覆盖已确认内容。</div>` : nothing}
+          ${stats.offline > 0 ? html`<div class="delivery-status">本频道离线发件箱有 ${stats.offline} 段待合并。恢复连接后按本频道序号与时间顺序提交，不与其他频道比对，也不会覆盖已确认内容。</div>` : nothing}
         </section>
 
         <section class="inspector-section">
@@ -756,7 +897,7 @@ export class CaptionDesk extends LitElement {
               <div><strong>原始字幕：</strong>${item.original}</div>
               <div style="margin-top: 8px;"><strong>修改前校正：</strong>${item.corrected}</div>
               <div style="margin-top: 8px; color: var(--cds-text-secondary);">${item.tags.length ? `标签：${item.tags.join('、')}` : '尚未应用术语标签'}</div>
-            ` : html`<span>请选择片段以查看上下文。</span>`}
+            ` : html`<span>请在${this.channelName(this.activeId)}选择片段以查看上下文。</span>`}
           </div>
         </section>
       </div>
@@ -765,46 +906,49 @@ export class CaptionDesk extends LitElement {
 
   render() {
     const stats = this.stats;
+    const channel = this.channel;
     const backlogRatio = Math.min(100, stats.backlog * 8);
     return html`
-      <div class="shell ${this.dark ? 'dark' : ''}" style=${`--caption-font-size: ${this.model.fontSize}px`}>
+      <div class="shell ${this.dark ? 'dark' : ''}" style=${`--caption-font-size: ${this.workbench.fontSize}px`}>
         <header class="topbar">
           <div class="brand">
             <div class="brand-mark">CC</div>
             <div class="brand-copy">
               <strong>LiveCaption Desk</strong>
-              <span>${this.model.eventName} · ${this.model.eventDate}</span>
+              <span>${this.channelName(this.activeId)} · ${channel.eventName} · 多频道值守</span>
             </div>
           </div>
-          <div class="connection-pill ${this.model.connection}">
+          <div class="connection-pill ${channel.connection}">
             <span class="connection-dot"></span>
             <div class="connection-copy">
-              <strong>${connectionLabel(this.model.connection)} · ${this.model.simulatedDelay.toFixed(1)} 秒延迟</strong>
-              <small>${this.model.connection === 'offline' ? '仍可编辑，确认内容进入离线发件箱' : `待确认队列 ${stats.pending} 段 · 最近自动保存 ${new Date(this.model.updatedAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}`}</small>
+              <strong>${this.channelName(this.activeId)} · ${connectionLabel(channel.connection)} · ${channel.simulatedDelay.toFixed(1)} 秒延迟</strong>
+              <small>${channel.connection === 'offline' ? '仍可编辑，确认内容进入本频道离线发件箱' : `本频道待确认队列 ${stats.pending} 段 · 最近自动保存 ${new Date(channel.updatedAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}`}</small>
             </div>
           </div>
           <div class="header-actions">
             <cds-button kind="ghost" size="sm" @click=${this.toggleTheme}>${this.dark ? '浅色界面' : '深色值守'}</cds-button>
             <cds-button kind="ghost" size="sm" @click=${this.undo}>撤销</cds-button>
             <cds-button kind="ghost" size="sm" @click=${this.redo}>重做</cds-button>
-            <cds-button kind="primary" size="sm" @click=${this.exportSrt}>导出 SRT</cds-button>
+            <cds-button kind="primary" size="sm" @click=${this.exportSrt}>导出本频道 SRT</cds-button>
           </div>
         </header>
 
+        ${this.renderChannelBar()}
+
         <section class="status-strip">
           <div class="status-cell hero">
-            <strong>${this.model.connection === 'offline' ? '离线校正中，确认后暂存发件箱' : stats.backlog > 8 ? '队列积压，建议优先处理过期片段' : '队列节奏正常，可以继续逐段确认'}</strong>
+            <strong>${channel.connection === 'offline' ? `${this.channelName(this.activeId)}离线校正中，确认后暂存本频道发件箱` : stats.backlog > 8 ? `${this.channelName(this.activeId)}队列积压，建议优先处理过期片段` : `${this.channelName(this.activeId)}队列节奏正常，可以继续逐段确认`}</strong>
             <span>待确认 ${stats.pending} · 过期 ${stats.stale} · 重复 ${stats.duplicate} · 离线待合并 ${stats.offline}</span>
             <div class="queue-track"><span style=${`width:${backlogRatio}%`}></span></div>
           </div>
           <div class="status-cell"><strong>${stats.pending}</strong><span>待确认片段</span></div>
           <div class="status-cell warning"><strong>${stats.oldestWaitSeconds}s</strong><span>最长等待时间</span></div>
           <div class="status-cell danger"><strong>${stats.stale + stats.duplicate}</strong><span>需要明确处理</span></div>
-          <div class="status-cell"><strong>${this.model.simulatedDelay.toFixed(1)}s</strong><span>当前流延迟</span></div>
+          <div class="status-cell"><strong>${channel.simulatedDelay.toFixed(1)}s</strong><span>当前流延迟</span></div>
           <div class="font-controls">
-            <label>字幕字号</label>
+            <label>字幕字号（全局）</label>
             <cds-button kind="ghost" size="sm" @click=${() => this.adjustFont(-1)}>A−</cds-button>
-            <strong>${this.model.fontSize}</strong>
+            <strong>${this.workbench.fontSize}</strong>
             <cds-button kind="ghost" size="sm" @click=${() => this.adjustFont(1)}>A＋</cds-button>
           </div>
         </section>
@@ -813,10 +957,10 @@ export class CaptionDesk extends LitElement {
           <section class="column">
             <div class="column-head">
               <div>
-                <h2>待确认区</h2>
-                <p>按收到顺序排列，重复和过期内容不会被静默覆盖</p>
+                <h2>${this.channelName(this.activeId)} · 待确认区</h2>
+                <p>按本频道收到顺序排列，重复和过期内容不会被静默覆盖</p>
               </div>
-              <cds-dropdown value=${this.filter} @cds-dropdown-selected=${(event: CustomEvent<{ item: { value: string } }>) => { this.filter = event.detail.item.value as typeof this.filter; }}>
+              <cds-dropdown .value=${this.draft.filter} @cds-dropdown-selected=${(event: CustomEvent<{ item: { value: string } }>) => this.patchDraft({ filter: event.detail.item.value as QueueFilter })}>
                 <cds-dropdown-item value="active">仅需处理</cds-dropdown-item>
                 <cds-dropdown-item value="attention">异常优先</cds-dropdown-item>
                 <cds-dropdown-item value="all">全部片段</cds-dropdown-item>
@@ -828,23 +972,23 @@ export class CaptionDesk extends LitElement {
           <section class="column">
             <div class="column-head">
               <div>
-                <h2>校对编辑台</h2>
-                <p>标点、专有名词、发言人和数字均可在确认前修改</p>
+                <h2>${this.channelName(this.activeId)} · 校对编辑台</h2>
+                <p>标点、专有名词、发言人和数字均可在确认前修改，草稿不跨频道</p>
               </div>
-              <cds-tag type="green" size="sm">本地草稿</cds-tag>
+              <cds-tag type="green" size="sm">${this.channelName(this.activeId)}本地草稿</cds-tag>
             </div>
-            <div class="column-body" style=${`font-size:${this.model.fontSize}px`}>${this.renderEditor()}</div>
+            <div class="column-body" style=${`font-size:${this.workbench.fontSize}px`}>${this.renderEditor()}</div>
           </section>
 
           <section class="column">
             <div class="column-head">
               <div>
-                <h2>规则与直播区</h2>
-                <p>确认后进入直播输出；离线内容恢复后统一合并</p>
+                <h2>${this.channelName(this.activeId)} · 规则与直播区</h2>
+                <p>确认后只进入本频道直播输出；离线内容恢复后在本频道内合并</p>
               </div>
-              ${this.model.connection === 'offline'
+              ${channel.connection === 'offline'
                 ? html`<cds-button kind="primary" size="sm" @click=${this.mergeOffline}>恢复并合并</cds-button>`
-                : html`<cds-button kind="danger--tertiary" size="sm" @click=${() => this.setConnection('offline')}>模拟断线</cds-button>`}
+                : html`<cds-button kind="danger--tertiary" size="sm" @click=${() => this.setConnection('offline')}>模拟本频道断线</cds-button>`}
             </div>
             <div class="column-body">${this.renderInspector()}</div>
           </section>
